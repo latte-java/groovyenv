@@ -22,8 +22,8 @@ resolve_version() {
   fi
 }
 
-resolve_latest_major() {
-  local major="$1"
+resolve_latest() {
+  local prefix="$1"
   local archive_url="https://archive.apache.org/dist/groovy/"
   local html
 
@@ -32,17 +32,17 @@ resolve_latest_major() {
     exit 1
   fi
 
-  # Parse version directories from HTML, filter to requested major, find latest stable
+  # Parse version directories from HTML, filter to requested prefix, find latest stable
   local version
   version="$(echo "${html}" \
     | sed -n 's/.*href="\([0-9][0-9.]*\)\/".*/\1/p' \
-    | grep "^${major}\." \
+    | grep "^${prefix}\." \
     | grep -v -E '(alpha|beta|rc|incubating)' \
     | sort -t. -k1,1n -k2,2n -k3,3n \
     | tail -1)"
 
   if [[ -z "${version}" ]]; then
-    echo "Error: No stable release found for Groovy ${major}" >&2
+    echo "Error: No stable release found for Groovy ${prefix}" >&2
     exit 1
   fi
 
@@ -50,8 +50,10 @@ resolve_latest_major() {
 }
 
 # NOTE: this function is duplicated in the shim template in cmd_reshim() — keep in sync
-resolve_major_to_installed() {
-  local major="$1"
+# Accepts a version prefix (major like "4" or major.minor like "4.0") and resolves
+# to the highest installed full version matching that prefix.
+resolve_prefix_to_installed() {
+  local prefix="$1"
   local best=""
 
   for dir in "${GROOVYENV_GROOVY_DIR}"/*/; do
@@ -59,9 +61,8 @@ resolve_major_to_installed() {
     local name
     name="$(basename "${dir}")"
 
-    # Check if this version starts with the requested major
-    local dir_major="${name%%.*}"
-    if [[ "${dir_major}" != "${major}" ]]; then
+    # Check if this version starts with the requested prefix
+    if [[ "${name}" != "${prefix}".* ]]; then
       continue
     fi
 
@@ -104,26 +105,26 @@ update_latte_config() {
 
   mkdir -p "${config_dir}"
 
-  # Collect unique major versions from installed Groovy versions, resolve each to the highest installed
-  local majors=""
+  # Collect unique major.minor versions from installed Groovy versions
+  local major_minors=""
   for dir in "${GROOVYENV_GROOVY_DIR}"/*/; do
     [[ -d "${dir}" ]] || continue
     local name
     name="$(basename "${dir}")"
-    local major="${name%%.*}"
-    if [[ " ${majors} " != *" ${major} "* ]]; then
-      majors="${majors} ${major}"
+    local major_minor="${name%.*}"
+    if [[ " ${major_minors} " != *" ${major_minor} "* ]]; then
+      major_minors="${major_minors} ${major_minor}"
     fi
   done
 
-  # Write config file sorted by major version
+  # Write config file sorted by major.minor version
   local content=""
-  for major in $(echo "${majors}" | tr ' ' '\n' | sort -n); do
-    [[ -z "${major}" ]] && continue
+  for major_minor in $(echo "${major_minors}" | tr ' ' '\n' | sort -t. -k1,1n -k2,2n); do
+    [[ -z "${major_minor}" ]] && continue
     local best
-    best="$(resolve_major_to_installed "${major}")"
+    best="$(resolve_prefix_to_installed "${major_minor}")"
     if [[ -n "${best}" ]]; then
-      content="${content}${major}=${GROOVYENV_GROOVY_DIR}/${best}"$'\n'
+      content="${content}${major_minor}=${GROOVYENV_GROOVY_DIR}/${best}"$'\n'
     fi
   done
 
@@ -170,14 +171,14 @@ cmd_install_list() {
 cmd_install() {
   local version="$1"
 
-  # If version has no dots, treat as major version — resolve to latest stable
-  if [[ "${version}" != *.* ]]; then
-    if [[ ! "${version}" =~ ^[0-9]+$ ]]; then
-      echo "Error: Invalid version '${version}'. Use a major version (e.g., 4) or full version (e.g., 4.0.31)" >&2
+  # If version is not a full version (less than 2 dots), treat as prefix — resolve to latest stable
+  if [[ "${version}" != *.*.* ]]; then
+    if [[ ! "${version}" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+      echo "Error: Invalid version '${version}'. Use a major version (e.g., 4), major.minor (e.g., 4.0), or full version (e.g., 4.0.31)" >&2
       exit 1
     fi
     echo "Resolving latest Groovy ${version}..."
-    version="$(resolve_latest_major "${version}")"
+    version="$(resolve_latest "${version}")"
     echo "Latest version: ${version}"
   fi
 
@@ -224,17 +225,17 @@ cmd_install() {
 }
 
 cmd_upgrade() {
-  local major="$1"
+  local prefix="$1"
 
-  if [[ ! "${major}" =~ ^[0-9]+$ ]]; then
-    echo "Error: Invalid major version '${major}'. Use a major version number (e.g., 4)" >&2
+  if [[ ! "${prefix}" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+    echo "Error: Invalid version '${prefix}'. Use a major (e.g., 4) or major.minor (e.g., 4.0)" >&2
     exit 1
   fi
 
   local installed
-  installed="$(resolve_major_to_installed "${major}")"
+  installed="$(resolve_prefix_to_installed "${prefix}")"
   if [[ -z "${installed}" ]]; then
-    echo "No Groovy ${major}.x installed. Run: groovyenv install ${major}" >&2
+    echo "No Groovy ${prefix}.x installed. Run: groovyenv install ${prefix}" >&2
     exit 1
   fi
 
@@ -242,7 +243,7 @@ cmd_upgrade() {
 
   echo "Checking for updates..."
   local latest
-  latest="$(resolve_latest_major "${major}")"
+  latest="$(resolve_latest "${prefix}")"
   echo "Latest:    ${latest}"
 
   if [[ "${installed}" == "${latest}" ]]; then
@@ -277,9 +278,9 @@ cmd_versions() {
   local current
   current="$(resolve_version | tr -d '[:space:]')"
 
-  # Resolve major-only to installed for comparison
-  if [[ -n "${current}" && "${current}" != *.* ]]; then
-    current="$(resolve_major_to_installed "${current}")"
+  # Resolve prefix (major or major.minor) to installed for comparison
+  if [[ -n "${current}" && "${current}" != *.*.* ]]; then
+    current="$(resolve_prefix_to_installed "${current}")"
   fi
 
   for dir in "${GROOVYENV_GROOVY_DIR}"/*/; do
@@ -305,10 +306,10 @@ cmd_current() {
 
   version="$(echo "${version}" | tr -d '[:space:]')"
 
-  # Resolve major-only version to installed
-  if [[ "${version}" != *.* ]]; then
+  # Resolve prefix (major or major.minor) to installed
+  if [[ "${version}" != *.*.* ]]; then
     local resolved
-    resolved="$(resolve_major_to_installed "${version}")"
+    resolved="$(resolve_prefix_to_installed "${version}")"
     if [[ -z "${resolved}" ]]; then
       echo "No Groovy ${version}.x installed. Run: groovyenv install ${version}" >&2
       exit 1
@@ -336,10 +337,10 @@ cmd_home() {
 
   version="$(echo "${version}" | tr -d '[:space:]')"
 
-  # Resolve major-only version to installed
-  if [[ "${version}" != *.* ]]; then
+  # Resolve prefix (major or major.minor) to installed
+  if [[ "${version}" != *.*.* ]]; then
     local resolved
-    resolved="$(resolve_major_to_installed "${version}")"
+    resolved="$(resolve_prefix_to_installed "${version}")"
     if [[ -z "${resolved}" ]]; then
       echo "No Groovy ${version}.x installed. Run: groovyenv install ${version}" >&2
       exit 1
@@ -353,12 +354,12 @@ cmd_home() {
 validate_version() {
   local version="$1"
 
-  if [[ "${version}" != *.* && ! "${version}" =~ ^[0-9]+$ ]]; then
-    echo "Error: Invalid version '${version}'. Use a major version (e.g., 4) or full version (e.g., 4.0.31)" >&2
+  if [[ ! "${version}" =~ ^[0-9]+(\.[0-9]+)*$ ]]; then
+    echo "Error: Invalid version '${version}'. Use a major (e.g., 4), major.minor (e.g., 4.0), or full version (e.g., 4.0.31)" >&2
     exit 1
   fi
 
-  if [[ "${version}" == *.* ]]; then
+  if [[ "${version}" == *.*.* ]]; then
     local dest="${GROOVYENV_GROOVY_DIR}/${version}"
     if [[ ! -d "${dest}" ]]; then
       echo "Groovy ${version} is not installed. Run: groovyenv install ${version}" >&2
@@ -366,7 +367,7 @@ validate_version() {
     fi
   else
     local resolved
-    resolved="$(resolve_major_to_installed "${version}")"
+    resolved="$(resolve_prefix_to_installed "${version}")"
     if [[ -z "${resolved}" ]]; then
       echo "No Groovy ${version}.x installed. Run: groovyenv install ${version}" >&2
       exit 1
@@ -556,13 +557,13 @@ cmd_doctor() {
 
     # Check if resolved version is actually installed
     version="$(echo "${version}" | tr -d '[:space:]')"
-    if [[ "${version}" != *.* ]]; then
+    if [[ "${version}" != *.*.* ]]; then
       local resolved
-      resolved="$(resolve_major_to_installed "${version}")"
+      resolved="$(resolve_prefix_to_installed "${version}")"
       if [[ -n "${resolved}" ]]; then
-        echo "[OK] Major version ${version} resolves to installed ${resolved}"
+        echo "[OK] Version prefix ${version} resolves to installed ${resolved}"
       else
-        echo "[ERROR] No installed Groovy matches major version ${version}"
+        echo "[ERROR] No installed Groovy matches version ${version}"
         echo "  Run: groovyenv install ${version}"
         issues=$((issues + 1))
       fi
@@ -650,17 +651,16 @@ resolve_version() {
   fi
 }
 
-# NOTE: keep in sync with resolve_major_to_installed() in the main script
-resolve_major_to_installed() {
-  local major="$1"
+# NOTE: keep in sync with resolve_prefix_to_installed() in the main script
+resolve_prefix_to_installed() {
+  local prefix="$1"
   local best=""
 
   for dir in "${GROOVYENV_GROOVY_DIR}"/*/; do
     [[ -d "${dir}" ]] || continue
     local name
     name="$(basename "${dir}")"
-    local dir_major="${name%%.*}"
-    if [[ "${dir_major}" != "${major}" ]]; then
+    if [[ "${name}" != "${prefix}".* ]]; then
       continue
     fi
 
@@ -698,9 +698,9 @@ fi
 
 version="$(echo "${version}" | tr -d '[:space:]')"
 
-# If version has no dots, resolve to highest installed major match
-if [[ "${version}" != *.* ]]; then
-  resolved="$(resolve_major_to_installed "${version}")"
+# If version is not a full version (less than 2 dots), resolve to highest installed match
+if [[ "${version}" != *.*.* ]]; then
+  resolved="$(resolve_prefix_to_installed "${version}")"
   if [[ -z "${resolved}" ]]; then
     echo "groovyenv: no Groovy ${version}.x installed. Run: groovyenv install ${version}" >&2
     exit 1
@@ -730,9 +730,9 @@ usage() {
 Usage: groovyenv <command> [args]
 
 Commands:
-  install <version>     Install a Groovy version (e.g., 4 or 4.0.31)
+  install <version>     Install a Groovy version (e.g., 4, 4.0, or 4.0.31)
   install -l|--list     List available Groovy versions from Apache archive
-  upgrade <major>       Upgrade an installed Groovy to the latest patch
+  upgrade <version>     Upgrade an installed Groovy to the latest patch (e.g., 4 or 4.0)
   uninstall <version>   Remove an installed Groovy version
   global <version>      Set the global Groovy version (~/.groovyversion)
   local <version>       Set the local Groovy version (./.groovyversion)
@@ -748,7 +748,7 @@ Commands:
 
 Version is resolved from .groovyversion in the current directory
 (searching up), falling back to ~/.groovyversion.
-A major version (e.g., 4) resolves to the latest installed patch.
+A major (e.g., 4) or major.minor (e.g., 4.0) resolves to the latest installed patch.
 EOF
 }
 
@@ -777,7 +777,7 @@ main() {
       ;;
     upgrade)
       if [[ $# -lt 1 ]]; then
-        echo "Usage: groovyenv upgrade <major>" >&2
+        echo "Usage: groovyenv upgrade <version>" >&2
         exit 1
       fi
       cmd_upgrade "$1"
