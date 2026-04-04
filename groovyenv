@@ -1,0 +1,844 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+GROOVYENV_GROOVY_DIR="${HOME}/.local/share/groovy"
+GROOVYENV_SHIM_DIR="${HOME}/.local/bin"
+
+# Executables to shim (union of bin/ contents across Groovy versions)
+SHIM_EXECUTABLES=(
+  grape groovy groovyc groovyConsole
+  groovydoc groovysh java2groovy startGroovy
+)
+
+resolve_version() {
+  if [[ -n "${GROOVYENV_VERSION:-}" ]]; then
+    echo "${GROOVYENV_VERSION}"
+  elif [[ -f ".groovyversion" ]]; then
+    cat ".groovyversion"
+  elif [[ -f "${HOME}/.groovyversion" ]]; then
+    cat "${HOME}/.groovyversion"
+  else
+    echo ""
+  fi
+}
+
+resolve_latest_major() {
+  local major="$1"
+  local archive_url="https://archive.apache.org/dist/groovy/"
+  local html
+
+  if ! html="$(curl -fsSL "${archive_url}")"; then
+    echo "Error: Failed to query Apache archive for Groovy versions" >&2
+    exit 1
+  fi
+
+  # Parse version directories from HTML, filter to requested major, find latest stable
+  local version
+  version="$(echo "${html}" \
+    | sed -n 's/.*href="\([0-9][0-9.]*\)\/".*/\1/p' \
+    | grep "^${major}\." \
+    | grep -v -E '(alpha|beta|rc|incubating)' \
+    | sort -t. -k1,1n -k2,2n -k3,3n \
+    | tail -1)"
+
+  if [[ -z "${version}" ]]; then
+    echo "Error: No stable release found for Groovy ${major}" >&2
+    exit 1
+  fi
+
+  echo "${version}"
+}
+
+# NOTE: this function is duplicated in the shim template in cmd_reshim() — keep in sync
+resolve_major_to_installed() {
+  local major="$1"
+  local best=""
+
+  for dir in "${GROOVYENV_GROOVY_DIR}"/*/; do
+    [[ -d "${dir}" ]] || continue
+    local name
+    name="$(basename "${dir}")"
+
+    # Check if this version starts with the requested major
+    local dir_major="${name%%.*}"
+    if [[ "${dir_major}" != "${major}" ]]; then
+      continue
+    fi
+
+    # Compare version segments to find the highest
+    if [[ -z "${best}" ]]; then
+      best="${name}"
+      continue
+    fi
+
+    # Split both versions on . for numeric comparison
+    local IFS='.'
+    local -a cur_parts=(${name})
+    local -a best_parts=(${best})
+    IFS=' '
+
+    local i
+    for ((i = 0; i < ${#cur_parts[@]}; i++)); do
+      local cur_seg="${cur_parts[$i]:-0}"
+      local best_seg="${best_parts[$i]:-0}"
+      if (( cur_seg > best_seg )); then
+        best="${name}"
+        break
+      elif (( cur_seg < best_seg )); then
+        break
+      fi
+    done
+  done
+
+  if [[ -z "${best}" ]]; then
+    echo ""
+    return
+  fi
+
+  echo "${best}"
+}
+
+update_latte_config() {
+  local config_dir="${HOME}/.config/latte/plugins"
+  local config_file="${config_dir}/org.lattejava.plugin.groovy.properties"
+
+  mkdir -p "${config_dir}"
+
+  # Collect unique major versions from installed Groovy versions, resolve each to the highest installed
+  local majors=""
+  for dir in "${GROOVYENV_GROOVY_DIR}"/*/; do
+    [[ -d "${dir}" ]] || continue
+    local name
+    name="$(basename "${dir}")"
+    local major="${name%%.*}"
+    if [[ " ${majors} " != *" ${major} "* ]]; then
+      majors="${majors} ${major}"
+    fi
+  done
+
+  # Write config file sorted by major version
+  local content=""
+  for major in $(echo "${majors}" | tr ' ' '\n' | sort -n); do
+    [[ -z "${major}" ]] && continue
+    local best
+    best="$(resolve_major_to_installed "${major}")"
+    if [[ -n "${best}" ]]; then
+      content="${content}${major}=${GROOVYENV_GROOVY_DIR}/${best}"$'\n'
+    fi
+  done
+
+  printf '%s' "${content}" > "${config_file}"
+}
+
+cmd_install_list() {
+  echo "Available Groovy versions from Apache archive:"
+  echo ""
+
+  local archive_url="https://archive.apache.org/dist/groovy/"
+  local html
+  if ! html="$(curl -fsSL "${archive_url}")"; then
+    echo "Error: Failed to query Apache archive" >&2
+    exit 1
+  fi
+
+  # Parse version directories, filter stable releases, group by major.minor
+  local current_major_minor="" prev_version=""
+
+  echo "${html}" \
+    | sed -n 's/.*href="\([0-9][0-9.]*\)\/".*/\1/p' \
+    | grep -v -E '(alpha|beta|rc|incubating)' \
+    | sort -t. -k1,1n -k2,2n -k3,3n \
+    | while read -r version; do
+        # Skip duplicates
+        if [[ "${version}" == "${prev_version}" ]]; then
+          continue
+        fi
+        prev_version="${version}"
+
+        local major_minor="${version%.*}"
+        if [[ "${major_minor}" != "${current_major_minor}" ]]; then
+          if [[ -n "${current_major_minor}" ]]; then
+            echo ""
+          fi
+          echo "Groovy ${major_minor}:"
+          current_major_minor="${major_minor}"
+        fi
+        echo "  ${version}"
+      done
+}
+
+cmd_install() {
+  local version="$1"
+
+  # If version has no dots, treat as major version — resolve to latest stable
+  if [[ "${version}" != *.* ]]; then
+    if [[ ! "${version}" =~ ^[0-9]+$ ]]; then
+      echo "Error: Invalid version '${version}'. Use a major version (e.g., 4) or full version (e.g., 4.0.31)" >&2
+      exit 1
+    fi
+    echo "Resolving latest Groovy ${version}..."
+    version="$(resolve_latest_major "${version}")"
+    echo "Latest version: ${version}"
+  fi
+
+  local dest tmp_dir
+  dest="${GROOVYENV_GROOVY_DIR}/${version}"
+
+  if [[ -d "${dest}" ]]; then
+    echo "Groovy ${version} is already installed at ${dest}"
+    return 0
+  fi
+
+  local url="https://archive.apache.org/dist/groovy/${version}/distribution/apache-groovy-binary-${version}.zip"
+
+  echo "Downloading Groovy ${version}..."
+  tmp_dir="$(mktemp -d)"
+  trap 'rm -rf "${tmp_dir}"' EXIT
+
+  local archive="${tmp_dir}/groovy.zip"
+  if ! curl -fSL -o "${archive}" "${url}"; then
+    echo "Error: Failed to download Groovy ${version}" >&2
+    echo "URL: ${url}" >&2
+    exit 1
+  fi
+
+  echo "Extracting..."
+  unzip -q "${archive}" -d "${tmp_dir}"
+
+  # Groovy zips extract to groovy-<version>/
+  local extracted_dir="${tmp_dir}/groovy-${version}"
+
+  if [[ ! -d "${extracted_dir}" ]]; then
+    echo "Error: Could not find extracted Groovy directory" >&2
+    exit 1
+  fi
+
+  mkdir -p "${dest}"
+  cp -a "${extracted_dir}/." "${dest}/"
+
+  echo "Installed Groovy ${version} to ${dest}"
+  trap - EXIT
+  rm -rf "${tmp_dir}"
+
+  update_latte_config
+}
+
+cmd_upgrade() {
+  local major="$1"
+
+  if [[ ! "${major}" =~ ^[0-9]+$ ]]; then
+    echo "Error: Invalid major version '${major}'. Use a major version number (e.g., 4)" >&2
+    exit 1
+  fi
+
+  local installed
+  installed="$(resolve_major_to_installed "${major}")"
+  if [[ -z "${installed}" ]]; then
+    echo "No Groovy ${major}.x installed. Run: groovyenv install ${major}" >&2
+    exit 1
+  fi
+
+  echo "Installed: ${installed}"
+
+  echo "Checking for updates..."
+  local latest
+  latest="$(resolve_latest_major "${major}")"
+  echo "Latest:    ${latest}"
+
+  if [[ "${installed}" == "${latest}" ]]; then
+    echo "Already up to date."
+    return 0
+  fi
+
+  cmd_install "${latest}"
+}
+
+cmd_uninstall() {
+  local version="$1"
+  local dest="${GROOVYENV_GROOVY_DIR}/${version}"
+
+  if [[ ! -d "${dest}" ]]; then
+    echo "Groovy ${version} is not installed" >&2
+    exit 1
+  fi
+
+  rm -rf "${dest}"
+  echo "Uninstalled Groovy ${version}"
+
+  update_latte_config
+}
+
+cmd_versions() {
+  if [[ ! -d "${GROOVYENV_GROOVY_DIR}" ]]; then
+    echo "No Groovy versions installed"
+    return 0
+  fi
+
+  local current
+  current="$(resolve_version | tr -d '[:space:]')"
+
+  # Resolve major-only to installed for comparison
+  if [[ -n "${current}" && "${current}" != *.* ]]; then
+    current="$(resolve_major_to_installed "${current}")"
+  fi
+
+  for dir in "${GROOVYENV_GROOVY_DIR}"/*/; do
+    [[ -d "${dir}" ]] || continue
+    local v
+    v="$(basename "${dir}")"
+    if [[ "${v}" == "${current}" ]]; then
+      echo "* ${v}"
+    else
+      echo "  ${v}"
+    fi
+  done
+}
+
+cmd_current() {
+  local version
+  version="$(resolve_version)"
+
+  if [[ -z "${version}" ]]; then
+    echo "No Groovy version set. Create .groovyversion or ~/.groovyversion" >&2
+    exit 1
+  fi
+
+  version="$(echo "${version}" | tr -d '[:space:]')"
+
+  # Resolve major-only version to installed
+  if [[ "${version}" != *.* ]]; then
+    local resolved
+    resolved="$(resolve_major_to_installed "${version}")"
+    if [[ -z "${resolved}" ]]; then
+      echo "No Groovy ${version}.x installed. Run: groovyenv install ${version}" >&2
+      exit 1
+    fi
+    version="${resolved}"
+  fi
+
+  local dest="${GROOVYENV_GROOVY_DIR}/${version}"
+  if [[ ! -d "${dest}" ]]; then
+    echo "Groovy ${version} is not installed. Run: groovyenv install ${version}" >&2
+    exit 1
+  fi
+
+  echo "${version}"
+}
+
+cmd_home() {
+  local version
+  version="$(resolve_version)"
+
+  if [[ -z "${version}" ]]; then
+    echo "No Groovy version set. Create .groovyversion or ~/.groovyversion" >&2
+    exit 1
+  fi
+
+  version="$(echo "${version}" | tr -d '[:space:]')"
+
+  # Resolve major-only version to installed
+  if [[ "${version}" != *.* ]]; then
+    local resolved
+    resolved="$(resolve_major_to_installed "${version}")"
+    if [[ -z "${resolved}" ]]; then
+      echo "No Groovy ${version}.x installed. Run: groovyenv install ${version}" >&2
+      exit 1
+    fi
+    version="${resolved}"
+  fi
+
+  echo "${GROOVYENV_GROOVY_DIR}/${version}"
+}
+
+validate_version() {
+  local version="$1"
+
+  if [[ "${version}" != *.* && ! "${version}" =~ ^[0-9]+$ ]]; then
+    echo "Error: Invalid version '${version}'. Use a major version (e.g., 4) or full version (e.g., 4.0.31)" >&2
+    exit 1
+  fi
+
+  if [[ "${version}" == *.* ]]; then
+    local dest="${GROOVYENV_GROOVY_DIR}/${version}"
+    if [[ ! -d "${dest}" ]]; then
+      echo "Groovy ${version} is not installed. Run: groovyenv install ${version}" >&2
+      exit 1
+    fi
+  else
+    local resolved
+    resolved="$(resolve_major_to_installed "${version}")"
+    if [[ -z "${resolved}" ]]; then
+      echo "No Groovy ${version}.x installed. Run: groovyenv install ${version}" >&2
+      exit 1
+    fi
+  fi
+}
+
+cmd_global() {
+  local version="$1"
+  validate_version "${version}"
+  echo "${version}" > "${HOME}/.groovyversion"
+  echo "Global Groovy version set to ${version}"
+}
+
+cmd_local() {
+  local version="$1"
+  validate_version "${version}"
+  echo "${version}" > ".groovyversion"
+  echo "Local Groovy version set to ${version} ($(pwd)/.groovyversion)"
+}
+
+cmd_shell() {
+  local version="$1"
+  validate_version "${version}"
+  echo "${version}"
+}
+
+cmd_init() {
+  local shell_name="${1:-}"
+
+  # Auto-detect shell from SHELL env var if not specified
+  if [[ -z "${shell_name}" ]]; then
+    shell_name="$(basename "${SHELL:-bash}")"
+  fi
+
+  case "${shell_name}" in
+    bash|zsh)
+      cat <<'INIT'
+export GROOVY_HOME="$(groovyenv home 2>/dev/null)"
+groovyenv() {
+  local command="${1:-}"
+  if [[ "${command}" == "shell" ]]; then
+    shift
+    if [[ "${1:-}" == "--unset" ]]; then
+      unset GROOVYENV_VERSION
+      echo "Cleared GROOVYENV_VERSION"
+    elif [[ -z "${1:-}" ]]; then
+      if [[ -n "${GROOVYENV_VERSION:-}" ]]; then
+        echo "${GROOVYENV_VERSION}"
+      else
+        echo "No shell version set"
+      fi
+    else
+      GROOVYENV_VERSION="$(command groovyenv shell "$1")" && export GROOVYENV_VERSION
+      export GROOVY_HOME="$(command groovyenv home 2>/dev/null)"
+    fi
+  else
+    command groovyenv "$@"
+    if [[ "${command}" == "global" || "${command}" == "local" ]]; then
+      export GROOVY_HOME="$(command groovyenv home 2>/dev/null)"
+    fi
+  fi
+}
+INIT
+      ;;
+    fish)
+      cat <<'INIT'
+if set -l ghome (groovyenv home 2>/dev/null)
+  set -gx GROOVY_HOME $ghome
+end
+function groovyenv
+  set -l command $argv[1]
+  if test "$command" = "shell"
+    if test (count $argv) -lt 2
+      if set -q GROOVYENV_VERSION
+        echo $GROOVYENV_VERSION
+      else
+        echo "No shell version set"
+      end
+    else if test "$argv[2]" = "--unset"
+      set -e GROOVYENV_VERSION
+      echo "Cleared GROOVYENV_VERSION"
+    else
+      set -gx GROOVYENV_VERSION (command groovyenv shell $argv[2])
+      if set -l ghome (command groovyenv home 2>/dev/null)
+        set -gx GROOVY_HOME $ghome
+      end
+    end
+  else
+    command groovyenv $argv
+    if test "$command" = "global" -o "$command" = "local"
+      if set -l ghome (command groovyenv home 2>/dev/null)
+        set -gx GROOVY_HOME $ghome
+      end
+    end
+  end
+end
+INIT
+      ;;
+    *)
+      echo "Error: Unsupported shell '${shell_name}'. Supported: bash, zsh, fish" >&2
+      exit 1
+      ;;
+  esac
+}
+
+cmd_doctor() {
+  local issues=0
+
+  echo "groovyenv doctor"
+  echo "================"
+  echo ""
+
+  # Check groovyenv is in PATH
+  if command -v groovyenv &>/dev/null; then
+    echo "[OK] groovyenv found at $(command -v groovyenv)"
+  else
+    echo "[ERROR] groovyenv is not in PATH"
+    issues=$((issues + 1))
+  fi
+
+  # Check shim directory exists
+  if [[ -d "${GROOVYENV_SHIM_DIR}" ]]; then
+    echo "[OK] Shim directory exists (${GROOVYENV_SHIM_DIR})"
+  else
+    echo "[ERROR] Shim directory missing (${GROOVYENV_SHIM_DIR})"
+    echo "  Run: groovyenv reshim"
+    issues=$((issues + 1))
+  fi
+
+  # Check shim directory is in PATH
+  if [[ ":${PATH}:" == *":${GROOVYENV_SHIM_DIR}:"* ]]; then
+    echo "[OK] Shim directory is in PATH"
+  else
+    echo "[ERROR] Shim directory (${GROOVYENV_SHIM_DIR}) is not in PATH"
+    echo "  Add ${GROOVYENV_SHIM_DIR} to your PATH"
+    issues=$((issues + 1))
+  fi
+
+  # Check shims exist
+  if [[ -x "${GROOVYENV_SHIM_DIR}/groovy" ]]; then
+    echo "[OK] Groovy shim exists"
+  else
+    echo "[ERROR] Groovy shim not found at ${GROOVYENV_SHIM_DIR}/groovy"
+    echo "  Run: groovyenv reshim"
+    issues=$((issues + 1))
+  fi
+
+  # Check shims come before system groovy in PATH
+  local groovy_path
+  groovy_path="$(command -v groovy 2>/dev/null || true)"
+  if [[ -n "${groovy_path}" ]]; then
+    if [[ "${groovy_path}" == "${GROOVYENV_SHIM_DIR}/groovy" ]]; then
+      echo "[OK] groovyenv shim is first groovy in PATH"
+    else
+      echo "[WARN] groovy resolves to ${groovy_path} (not the groovyenv shim)"
+      echo "  Ensure ${GROOVYENV_SHIM_DIR} appears before $(dirname "${groovy_path}") in PATH"
+      issues=$((issues + 1))
+    fi
+  else
+    echo "[WARN] No groovy found in PATH"
+  fi
+
+  # Check groovy directory exists
+  if [[ -d "${GROOVYENV_GROOVY_DIR}" ]]; then
+    local version_count
+    version_count=$(find "${GROOVYENV_GROOVY_DIR}" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')
+    echo "[OK] Groovy directory exists with ${version_count} version(s) installed"
+  else
+    echo "[WARN] Groovy directory missing (${GROOVYENV_GROOVY_DIR})"
+    echo "  Run: groovyenv install <version>"
+  fi
+
+  # Check version resolution
+  local version
+  version="$(resolve_version)"
+  if [[ -n "${version}" ]]; then
+    local source="unknown"
+    if [[ -n "${GROOVYENV_VERSION:-}" ]]; then
+      source="GROOVYENV_VERSION"
+    elif [[ -f ".groovyversion" ]]; then
+      source=".groovyversion"
+    elif [[ -f "${HOME}/.groovyversion" ]]; then
+      source="~/.groovyversion"
+    fi
+    echo "[OK] Version ${version} resolved from ${source}"
+
+    # Check if resolved version is actually installed
+    version="$(echo "${version}" | tr -d '[:space:]')"
+    if [[ "${version}" != *.* ]]; then
+      local resolved
+      resolved="$(resolve_major_to_installed "${version}")"
+      if [[ -n "${resolved}" ]]; then
+        echo "[OK] Major version ${version} resolves to installed ${resolved}"
+      else
+        echo "[ERROR] No installed Groovy matches major version ${version}"
+        echo "  Run: groovyenv install ${version}"
+        issues=$((issues + 1))
+      fi
+    else
+      if [[ -d "${GROOVYENV_GROOVY_DIR}/${version}" ]]; then
+        echo "[OK] Groovy ${version} is installed"
+      else
+        echo "[ERROR] Groovy ${version} is not installed"
+        echo "  Run: groovyenv install ${version}"
+        issues=$((issues + 1))
+      fi
+    fi
+  else
+    echo "[WARN] No Groovy version configured"
+    echo "  Run: groovyenv global <version>"
+  fi
+
+  # Check GROOVY_HOME
+  if [[ -n "${GROOVY_HOME:-}" ]]; then
+    if [[ -d "${GROOVY_HOME}" ]]; then
+      local expected_home
+      expected_home="$(cmd_home 2>/dev/null || true)"
+      if [[ -n "${expected_home}" && "${GROOVY_HOME}" == "${expected_home}" ]]; then
+        echo "[OK] GROOVY_HOME is set correctly (${GROOVY_HOME})"
+      elif [[ -n "${expected_home}" ]]; then
+        echo "[WARN] GROOVY_HOME (${GROOVY_HOME}) does not match groovyenv home (${expected_home})"
+        echo "  Add eval \"\$(groovyenv init)\" to your shell profile"
+        issues=$((issues + 1))
+      else
+        echo "[WARN] GROOVY_HOME is set (${GROOVY_HOME}) but groovyenv cannot determine expected value"
+      fi
+    else
+      echo "[ERROR] GROOVY_HOME is set to a non-existent directory: ${GROOVY_HOME}"
+      issues=$((issues + 1))
+    fi
+  else
+    echo "[WARN] GROOVY_HOME is not set"
+    echo "  Add eval \"\$(groovyenv init)\" to your shell profile"
+  fi
+
+  echo ""
+  if [[ ${issues} -eq 0 ]]; then
+    echo "No issues found."
+  else
+    echo "${issues} issue(s) found."
+  fi
+}
+
+cmd_reshim() {
+  mkdir -p "${GROOVYENV_SHIM_DIR}"
+
+  for exe in "${SHIM_EXECUTABLES[@]}"; do
+    local shim_path="${GROOVYENV_SHIM_DIR}/${exe}"
+
+    # Don't overwrite non-shim files
+    if [[ -f "${shim_path}" && ! -L "${shim_path}" ]]; then
+      if ! head -2 "${shim_path}" | grep -q "groovyenv shim"; then
+        echo "Skipping ${exe}: ${shim_path} exists and is not a groovyenv shim" >&2
+        continue
+      fi
+    fi
+
+    cat > "${shim_path}" <<'SHIM'
+#!/usr/bin/env bash
+# groovyenv shim
+set -euo pipefail
+
+GROOVYENV_GROOVY_DIR="${HOME}/.local/share/groovy"
+
+resolve_version() {
+  if [[ -n "${GROOVYENV_VERSION:-}" ]]; then
+    echo "${GROOVYENV_VERSION}"
+    return
+  fi
+  local dir="$PWD"
+  while [[ "${dir}" != "" ]]; do
+    if [[ -f "${dir}/.groovyversion" ]]; then
+      cat "${dir}/.groovyversion"
+      return
+    fi
+    dir="${dir%/*}"
+  done
+  if [[ -f "${HOME}/.groovyversion" ]]; then
+    cat "${HOME}/.groovyversion"
+  fi
+}
+
+# NOTE: keep in sync with resolve_major_to_installed() in the main script
+resolve_major_to_installed() {
+  local major="$1"
+  local best=""
+
+  for dir in "${GROOVYENV_GROOVY_DIR}"/*/; do
+    [[ -d "${dir}" ]] || continue
+    local name
+    name="$(basename "${dir}")"
+    local dir_major="${name%%.*}"
+    if [[ "${dir_major}" != "${major}" ]]; then
+      continue
+    fi
+
+    if [[ -z "${best}" ]]; then
+      best="${name}"
+      continue
+    fi
+
+    local IFS='.'
+    local -a cur_parts=(${name})
+    local -a best_parts=(${best})
+    IFS=' '
+
+    local i
+    for ((i = 0; i < ${#cur_parts[@]}; i++)); do
+      local cur_seg="${cur_parts[$i]:-0}"
+      local best_seg="${best_parts[$i]:-0}"
+      if (( cur_seg > best_seg )); then
+        best="${name}"
+        break
+      elif (( cur_seg < best_seg )); then
+        break
+      fi
+    done
+  done
+
+  echo "${best}"
+}
+
+version="$(resolve_version)"
+if [[ -z "${version}" ]]; then
+  echo "groovyenv: no .groovyversion file found in directory hierarchy or ~/.groovyversion" >&2
+  exit 1
+fi
+
+version="$(echo "${version}" | tr -d '[:space:]')"
+
+# If version has no dots, resolve to highest installed major match
+if [[ "${version}" != *.* ]]; then
+  resolved="$(resolve_major_to_installed "${version}")"
+  if [[ -z "${resolved}" ]]; then
+    echo "groovyenv: no Groovy ${version}.x installed. Run: groovyenv install ${version}" >&2
+    exit 1
+  fi
+  version="${resolved}"
+fi
+
+exe_name="$(basename "$0")"
+exe_path="${GROOVYENV_GROOVY_DIR}/${version}/bin/${exe_name}"
+
+if [[ ! -x "${exe_path}" ]]; then
+  echo "groovyenv: ${exe_name} not found for Groovy ${version}" >&2
+  echo "Run: groovyenv install ${version}" >&2
+  exit 1
+fi
+
+exec "${exe_path}" "$@"
+SHIM
+    chmod +x "${shim_path}"
+  done
+
+  echo "Shims installed to ${GROOVYENV_SHIM_DIR}"
+}
+
+usage() {
+  cat <<EOF
+Usage: groovyenv <command> [args]
+
+Commands:
+  install <version>     Install a Groovy version (e.g., 4 or 4.0.31)
+  install -l|--list     List available Groovy versions from Apache archive
+  upgrade <major>       Upgrade an installed Groovy to the latest patch
+  uninstall <version>   Remove an installed Groovy version
+  global <version>      Set the global Groovy version (~/.groovyversion)
+  local <version>       Set the local Groovy version (./.groovyversion)
+  shell <version>       Set Groovy version for the current shell session
+  shell --unset         Clear the shell version override
+  init [shell]          Output shell code to set GROOVY_HOME (bash/zsh/fish)
+  versions              List installed Groovy versions
+  current               Show the currently active Groovy version
+  home                  Print GROOVY_HOME for the current version
+  doctor                Diagnose common setup problems
+  reshim                Regenerate shims in ~/.local/bin
+  help                  Show this help message
+
+Version is resolved from .groovyversion in the current directory
+(searching up), falling back to ~/.groovyversion.
+A major version (e.g., 4) resolves to the latest installed patch.
+EOF
+}
+
+main() {
+  if [[ $# -lt 1 ]]; then
+    usage
+    exit 1
+  fi
+
+  local command="$1"
+  shift
+
+  case "${command}" in
+    install)
+      if [[ $# -lt 1 ]]; then
+        echo "Usage: groovyenv install <version>" >&2
+        echo "       groovyenv install -l|--list" >&2
+        exit 1
+      fi
+      if [[ "$1" == "-l" || "$1" == "--list" ]]; then
+        cmd_install_list
+      else
+        cmd_install "$1"
+        cmd_reshim
+      fi
+      ;;
+    upgrade)
+      if [[ $# -lt 1 ]]; then
+        echo "Usage: groovyenv upgrade <major>" >&2
+        exit 1
+      fi
+      cmd_upgrade "$1"
+      ;;
+    uninstall)
+      if [[ $# -lt 1 ]]; then
+        echo "Usage: groovyenv uninstall <version>" >&2
+        exit 1
+      fi
+      cmd_uninstall "$1"
+      ;;
+    global)
+      if [[ $# -lt 1 ]]; then
+        echo "Usage: groovyenv global <version>" >&2
+        exit 1
+      fi
+      cmd_global "$1"
+      ;;
+    local)
+      if [[ $# -lt 1 ]]; then
+        echo "Usage: groovyenv local <version>" >&2
+        exit 1
+      fi
+      cmd_local "$1"
+      ;;
+    versions)
+      cmd_versions
+      ;;
+    current)
+      cmd_current
+      ;;
+    home)
+      cmd_home
+      ;;
+    shell)
+      if [[ $# -lt 1 ]]; then
+        echo "Usage: groovyenv shell <version>" >&2
+        echo "       groovyenv shell --unset" >&2
+        echo "Note: requires groovyenv init in your shell profile" >&2
+        exit 1
+      fi
+      cmd_shell "$1"
+      ;;
+    init)
+      cmd_init "${1:-}"
+      ;;
+    doctor)
+      cmd_doctor
+      ;;
+    reshim)
+      cmd_reshim
+      ;;
+    help|--help|-h)
+      usage
+      ;;
+    *)
+      echo "Unknown command: ${command}" >&2
+      usage
+      exit 1
+      ;;
+  esac
+}
+
+main "$@"
