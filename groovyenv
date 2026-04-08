@@ -13,12 +13,18 @@ SHIM_EXECUTABLES=(
 resolve_version() {
   if [[ -n "${GROOVYENV_VERSION:-}" ]]; then
     echo "${GROOVYENV_VERSION}"
-  elif [[ -f ".groovyversion" ]]; then
-    cat ".groovyversion"
-  elif [[ -f "${HOME}/.groovyversion" ]]; then
+    return
+  fi
+  local dir="$PWD"
+  while [[ "${dir}" != "" && "${dir}" != "${HOME}" ]]; do
+    if [[ -f "${dir}/.groovyversion" ]]; then
+      cat "${dir}/.groovyversion"
+      return
+    fi
+    dir="${dir%/*}"
+  done
+  if [[ -f "${HOME}/.groovyversion" ]]; then
     cat "${HOME}/.groovyversion"
-  else
-    echo ""
   fi
 }
 
@@ -639,7 +645,7 @@ resolve_version() {
     return
   fi
   local dir="$PWD"
-  while [[ "${dir}" != "" ]]; do
+  while [[ "${dir}" != "" && "${dir}" != "${HOME}" ]]; do
     if [[ -f "${dir}/.groovyversion" ]]; then
       cat "${dir}/.groovyversion"
       return
